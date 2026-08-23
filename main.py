@@ -3,30 +3,36 @@ from pydantic import BaseModel
 import uvicorn
 import sqlite3
 from datetime import datetime
+import pickle
+import numpy as np
+import pandas as pd
 
-app = FastAPI(title="Predictive Maintenance Data Receiver")
+app = FastAPI(title="Predictive Maintenance API with AI")
 
 # --- DATABASE SETUP ---
-# Connect to SQLite. check_same_thread=False allows FastAPI's asynchronous nature to work with SQLite.
 conn = sqlite3.connect("sensor_data.db", check_same_thread=False)
 cursor = conn.cursor()
-
-# Create the table if it doesn't already exist
 cursor.execute('''
     CREATE TABLE IF NOT EXISTS vibrations (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT,
         device_id TEXT,
-        ax REAL,
-        ay REAL,
-        az REAL,
-        temp REAL
+        ax REAL, ay REAL, az REAL, temp REAL,
+        status TEXT
     )
 ''')
 conn.commit()
-print("[+] Database initialized successfully.")
+print("[+] Database initialized.")
 
-# --- DATA SCHEMA ---
+# --- LOAD AI MODEL ---
+try:
+    with open('motor_ai_model.pkl', 'rb') as f:
+        ai_model = pickle.load(f)
+    print("[+] AI Model loaded successfully.")
+except FileNotFoundError:
+    print("[-] WARNING: AI Model not found. Run train_model.py first.")
+    ai_model = None
+
 class SensorPayload(BaseModel):
     device_id: str
     ax: float
@@ -34,50 +40,37 @@ class SensorPayload(BaseModel):
     az: float
     temp: float
 
-# --- ENDPOINTS ---
-
-@app.get("/")
-def read_root():
-    return {"status": "online", "message": "Predictive Maintenance API is running"}
-
-# 1. The Receiver (ESP32 sends data here)
 @app.post("/data")
 async def receive_vibration_data(data: SensorPayload):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
     
-    # Write the incoming data into the database
+    status = "Normal"
+    
+    # Run AI Prediction if model is loaded
+    if ai_model:
+        # Extract features from the single incoming data point
+        incoming_features = pd.DataFrame([{
+            'rms_x': data.ax ** 2,
+            'rms_y': data.ay ** 2,
+            'rms_z': data.az ** 2,
+            'magnitude': np.sqrt(data.ax**2 + data.ay**2 + data.az**2)
+        }])
+        
+        # The AI returns 1 for Normal, -1 for Anomaly
+        prediction = ai_model.predict(incoming_features)
+        
+        if prediction[0] == -1:
+            status = "ANOMALY DETECTED"
+    
     cursor.execute('''
-        INSERT INTO vibrations (timestamp, device_id, ax, ay, az, temp)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (timestamp, data.device_id, data.ax, data.ay, data.az, data.temp))
+        INSERT INTO vibrations (timestamp, device_id, ax, ay, az, temp, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (timestamp, data.device_id, data.ax, data.ay, data.az, data.temp, status))
     conn.commit()
     
-    # Still print to terminal so you can see it working
-    print(f"[{timestamp}] Saved to DB -> Ax: {data.ax:6.2f} | Ay: {data.ay:6.2f} | Az: {data.az:6.2f}")
+    print(f"[{timestamp}] Status: {status} | Mag: {np.sqrt(data.ax**2 + data.ay**2 + data.az**2):.2f}")
     
-    return {"status": "saved"}
-
-# 2. The Provider (Frontend will fetch data from here)
-@app.get("/data")
-def get_historical_data(limit: int = 100):
-    # Fetch the most recent rows, up to the 'limit' requested
-    cursor.execute('SELECT * FROM vibrations ORDER BY timestamp DESC LIMIT ?', (limit,))
-    rows = cursor.fetchall()
-    
-    # Package the raw database rows back into a clean list of dictionaries
-    results = []
-    for row in rows:
-        results.append({
-            "id": row[0],
-            "timestamp": row[1],
-            "device_id": row[2],
-            "ax": row[3],
-            "ay": row[4],
-            "az": row[5],
-            "temp": row[6]
-        })
-        
-    return {"data": results}
+    return {"status": "saved", "machine_status": status}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
