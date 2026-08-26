@@ -1,6 +1,5 @@
 import sqlite3
 import pandas as pd
-import numpy as np
 import pickle
 from sklearn.ensemble import IsolationForest
 
@@ -10,31 +9,39 @@ query = "SELECT ax, ay, az FROM vibrations ORDER BY id ASC"
 df = pd.read_sql_query(query, conn)
 conn.close()
 
-print(f"[-] Loaded {len(df)} readings from the database.")
-
-# 1. Feature Engineering (Creating meaningful numbers for the AI)
-# We calculate the RMS (Root Mean Square) for each axis. This represents the total "energy" of the vibration.
-# We also calculate the total vector magnitude (combining X, Y, and Z).
-
-print("[-] Extracting features...")
+print("[-] Extracting advanced 6D features (Variance + Amplitude)...")
 features = pd.DataFrame()
-features['rms_x'] = df['ax'] ** 2
-features['rms_y'] = df['ay'] ** 2
-features['rms_z'] = df['az'] ** 2
-features['magnitude'] = np.sqrt(df['ax']**2 + df['ay']**2 + df['az']**2)
 
-# 2. Initialize the AI Model
-# contamination=0.01 means we expect about 1% of the training data might be random noise.
-print("[-] Initializing Isolation Forest model...")
-model = IsolationForest(contamination=0.01, random_state=42)
+# 1. Variance (Total Energy)
+features['var_x'] = df['ax'].rolling(window=10).var()
+features['var_y'] = df['ay'].rolling(window=10).var()
+features['var_z'] = df['az'].rolling(window=10).var()
 
-# 3. Train the Model
-print("[-] Training AI on baseline motor data...")
+# 2. Peak-to-Peak (Impact Spikes)
+features['ptp_x'] = df['ax'].rolling(window=10).max() - df['ax'].rolling(window=10).min()
+features['ptp_y'] = df['ay'].rolling(window=10).max() - df['ay'].rolling(window=10).min()
+features['ptp_z'] = df['az'].rolling(window=10).max() - df['az'].rolling(window=10).min()
+
+# Clean up empty rows
+features = features.dropna()
+
+print(f"[-] Total rows before cleaning: {len(features)}")
+
+# Strip out data where the motor was off (var_x < 20)
+features = features[features['var_x'] > 20]
+
+print(f"[-] Total rows after removing 'Off' states: {len(features)}")
+
+if len(features) < 50:
+    print("[-] ERROR: Not enough 'Motor On' data! Run the motor longer.")
+    exit()
+
+print("[-] Training advanced Isolation Forest...")
+# Contamination at 0.05 creates a very strict boundary
+model = IsolationForest(contamination=0.05, random_state=42)
 model.fit(features)
 
-# 4. Save the Model (Pickling)
-# We save the trained model to a file so our FastAPI server can load it and use it live.
 with open('motor_ai_model.pkl', 'wb') as f:
     pickle.dump(model, f)
 
-print("[+] Model trained and saved successfully as 'motor_ai_model.pkl'.")
+print("[+] 6D AI Brain upgraded and saved.")
